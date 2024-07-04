@@ -7,7 +7,9 @@ package run
 
 import (
 	"context"
+	"fmt"
 	"go/build"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -21,10 +23,11 @@ import (
 )
 
 var CmdRun = &base.Command{
-	UsageLine: "go run [build flags] [-exec xprog] package [arguments...]",
+	UsageLine: "go run [build flags] [-exec xprog] [URL] package [arguments...]",
 	Short:     "compile and run Go program",
 	Long: `
-Run compiles and runs the named main Go package.
+Run compiles and runs the named main Go package,
+optionally from an archive resource identified by the given URL.
 Typically the package is specified as a list of .go source files from a single
 directory, but it may also be an import path, file system path, or pattern
 matching a single known package, as in 'go run .' or 'go run my/cmd'.
@@ -39,6 +42,19 @@ module-aware mode or GOPATH mode, depending on the GO111MODULE environment
 variable and the presence of a go.mod file. See 'go help modules' for details.
 If module-aware mode is enabled, "go run" runs in the context of the main
 module.
+
+If URL is specified, the scheme must be one of file, http, or https.
+Archive format is determined by "Content-Type" header or file extension.
+Supported extensions are .tar, .tar.gz, .tgz, and .zip.
+
+The following flags only apply to URL archive resource:
+
+	-header header
+		Extra header to include when sending HTTP requests.
+		May be used several times in a command line.
+		Each header must be of the form 'Header: value'.
+	-insecure
+		This option skips the verification step and proceed without checking.
 
 By default, 'go run' runs the compiled binary directly: 'a.out arguments...'.
 If the -exec flag is given, 'go run' invokes the binary using xprog:
@@ -63,6 +79,25 @@ See also: go build.
 	`,
 }
 
+var (
+	runHeaders  headerFlag
+	runInsecure = CmdRun.Flag.Bool("insecure", false, "")
+)
+
+type headerFlag []string
+
+func (v *headerFlag) Set(s string) error {
+	if !strings.Contains(s, ":") {
+		return fmt.Errorf("invalid custom header %q, format: '<name>: <value>'", s)
+	}
+	*v = append(*v, s)
+	return nil
+}
+
+func (v *headerFlag) String() string {
+	return "<HeaderFlag>"
+}
+
 func init() {
 	CmdRun.Run = runRun // break init loop
 
@@ -71,9 +106,24 @@ func init() {
 		work.AddCoverFlags(CmdRun, nil)
 	}
 	CmdRun.Flag.Var((*base.StringsFlag)(&work.ExecCmd), "exec", "")
+	CmdRun.Flag.Var(&runHeaders, "header", "")
 }
 
 func runRun(ctx context.Context, cmd *base.Command, args []string) {
+	if shouldUseURLResource(args) {
+		dir, err := os.MkdirTemp("", "cmd-go-run-")
+		if err != nil {
+			base.Fatalf("go: %v", err)
+		}
+		if err := extractURL(args[0], dir, runHeaders, *runInsecure); err != nil {
+			base.Fatalf("go: %v", err)
+		}
+		if err := os.Chdir(dir); err != nil {
+			base.Fatalf("go: %v", err)
+		}
+		args = args[1:]
+	}
+
 	if shouldUseOutsideModuleMode(args) {
 		// Set global module flags for 'go run cmd@version'.
 		// This must be done before modload.Init, but we need to call work.BuildInit
@@ -194,6 +244,15 @@ func shouldUseOutsideModuleMode(args []string) bool {
 		strings.Contains(args[0], "@") &&
 		!build.IsLocalImport(args[0]) &&
 		!filepath.IsAbs(args[0])
+}
+
+// shouldUseURLResource returns true if the first arg specifies URL
+// with scheme "file", "http", or "https".
+func shouldUseURLResource(args []string) bool {
+	return len(args) > 0 &&
+		(strings.HasPrefix(args[0], "file:") ||
+			strings.HasPrefix(args[0], "http:") ||
+			strings.HasPrefix(args[0], "https:"))
 }
 
 // buildRunProgram is the action for running a binary that has already
